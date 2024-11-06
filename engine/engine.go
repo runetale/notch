@@ -23,18 +23,20 @@ type Engine struct {
 	maxHistory uint
 	task       *task.Task
 	timeout    *time.Duration
+	nativeTool bool
 
 	waitCh chan struct{}
 }
 
-func NewEngine(t *task.Task, c *llm.LLMFactory, maxIterations uint) *Engine {
+func NewEngine(t *task.Task, c *llm.LLMFactory, maxIterations uint, nativeTool bool) *Engine {
 	channel := events.NewChannel()
 
 	serializationInvocationCb := func(inv *llm.Invocation) *string {
 		return serializer.SerializeInvocation(inv)
 	}
-
 	s := state.NewState(channel, t, maxIterations, serializationInvocationCb)
+
+	// check using native tools
 
 	return &Engine{
 		channel:    channel,
@@ -43,6 +45,7 @@ func NewEngine(t *task.Task, c *llm.LLMFactory, maxIterations uint) *Engine {
 		state:      s,
 		task:       t,
 		timeout:    s.GetTask().GetTimeout(),
+		nativeTool: nativeTool,
 		waitCh:     make(chan struct{}),
 	}
 }
@@ -50,6 +53,13 @@ func NewEngine(t *task.Task, c *llm.LLMFactory, maxIterations uint) *Engine {
 func (e *Engine) Start() {
 	go e.consumeEvent()
 	go e.automaton()
+
+	// waiting terminated engine process
+	comp := <-e.state.Complete()
+	if comp {
+		log.Printf("shutdown...")
+		e.Stop()
+	}
 }
 
 func (e *Engine) Stop() {
@@ -63,10 +73,19 @@ func (e *Engine) Done() <-chan struct{} {
 // for only display
 func (e *Engine) consumeEvent() {
 	for {
-		// waiting receiver for each events
+		// waiting event cahn for each events
 		event := <-e.channel.Chan
 		switch event.EventType() {
+		case events.MetricsUpdate:
+		case events.StorageUpdate:
+		case events.StateUpdate:
+		case events.InvalidUpdate:
+		case events.InvalidAction:
+		case events.InvalidResponse:
+		case events.ActionTimeOut:
 		case events.ActionExecuted:
+		case events.TaskComplete:
+		case events.EmptyResponse:
 
 		}
 	}
@@ -81,23 +100,26 @@ func (e *Engine) automaton() {
 		e.OnUpdateState(option, false)
 
 		// response from llm
-		invocations := []*llm.Invocation{}
-		toolCalls, response := e.factory.Chat(option)
+		var invocations []*llm.Invocation
+		toolCalls, response := e.factory.Chat(option, e.nativeTool, e.state.GetNamespaces())
+
 		// use our strategy
-		if toolCalls == nil {
+		if len(toolCalls) == 0 {
 			invocations = serializer.TryParse(response)
+		} else {
+			// use native function call by model supports
+			invocations = toolCalls
 		}
-		// use native function call by model supports
-		invocations = toolCalls
 
 		// return to llm response was null
-		if invocations == nil {
+		if len(invocations) == 0 {
 			if response == "" {
 				e.onEmptyResponse()
 				continue
+			} else {
+				e.onInvalidResponse(response)
+				continue
 			}
-			e.onInvalidResponse(response)
-			continue
 		}
 
 		// update metrics
@@ -108,14 +130,14 @@ func (e *Engine) automaton() {
 			// found action
 			ac := e.state.GetAciton(inv.Action)
 			if ac == nil {
-				e.onInvalidAction(inv, fmt.Sprintf("cannot found action %s", inv.Action))
+				e.onInvalidAction(inv, fmt.Sprintf("cannot found action by %s", inv.Action))
 				break
 			}
 
 			// validate actions
 			err := inv.ValidateAction(ac)
 			if err != nil {
-				e.onInvalidAction(inv, fmt.Sprintf("invalid action %s", inv.Action))
+				e.onInvalidAction(inv, fmt.Sprintf("invalid action %s", err.Error()))
 				break
 			}
 
@@ -134,8 +156,7 @@ func (e *Engine) automaton() {
 				inp := "nope"
 
 				for inp != "" && inp != "n" && inp != "y" {
-					fmt.Println("invocation by y or n")
-					fmt.Printf("%v\n", inv)
+					log.Println("invocation by y or n")
 					inp = e.task.GetUserInput(fmt.Sprintf("%s [Yn] ", inv.FunctionCallString()))
 					inp = strings.ToLower(inp)
 				}
@@ -162,12 +183,7 @@ func (e *Engine) automaton() {
 
 		// update state
 		e.OnUpdateState(option, true)
-
-		// terminated engine process
-		comp := <-e.state.Complete()
-		if comp {
-			e.Stop()
-		}
+		continue
 	}
 }
 
@@ -203,7 +219,7 @@ func (e *Engine) prepareAutomaton() *llm.ChatOption {
 	// get system prompt by state
 	systemPrompt, err := serializer.DisplaySystemPrompt(e.state)
 	if err != nil {
-
+		log.Fatalf("prepare automaton error %s", err.Error())
 	}
 
 	// get prompt by state
@@ -220,7 +236,7 @@ func (e *Engine) OnUpdateState(options *llm.ChatOption, refresh bool) {
 		// update prompt
 		sysprompt, err := serializer.DisplaySystemPrompt(e.state)
 		if err != nil {
-			panic(err)
+			log.Printf("error on update state %s", err.Error())
 		}
 		options.UpdateSystemPrompt(sysprompt)
 
@@ -235,10 +251,10 @@ func (e *Engine) sendEvent(events *events.Event) {
 	e.state.OnEvent(events)
 }
 
-func (e *Engine) onInvalidResponse(reponse string) {
+func (e *Engine) onInvalidResponse(response string) {
 	e.state.IncrementUnparsedMetrics()
-	e.state.AddUnparsedResponseToHistory(reponse, "no effective solution found, follow the instructions to correct this")
-	e.state.OnEvent(events.NewEvent(events.InvalidResponse, "engine", "on-invalid-response"))
+	e.state.AddUnparsedResponseToHistory(response, "no effective solution found, follow the instructions to correct this")
+	e.state.OnEvent(events.NewEvent(events.InvalidResponse, "engine", fmt.Sprintf("agent did not provide valid instructions: \n\n%s\n\n", response)))
 }
 
 func (e *Engine) onEmptyResponse() {
@@ -258,7 +274,7 @@ func (e *Engine) onValidAction() {
 func (e *Engine) onInvalidAction(inv *llm.Invocation, err string) {
 	e.state.IncrementUnknownMetrics()
 	e.state.AddErrorToHistory(inv, err)
-	e.state.OnEvent(events.NewEvent(events.InvalidAction, "engine", "on-invalid-action"))
+	e.state.OnEvent(events.NewEvent(events.InvalidAction, "engine", fmt.Sprintf("on-invalid-action %s", err)))
 }
 
 func (e *Engine) onExecutedErrorAction(inv *llm.Invocation, err *string, start time.Duration) {
